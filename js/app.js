@@ -1,20 +1,9 @@
-HeriExcel.Pro — app.js  v7.9
+/* ===============================================
+   HeriExcel.Pro — app.js  v7.9
    Carga de archivos, renderizado de tabla,
    contexto, filtros, busqueda, zoom,
    exportacion, impresion, fijar filas,
    notas, fill-handle
-
-   CAMBIOS v7.9:
-   - exportXLSX() usa XLSXStyle cuando está disponible
-     para preservar colores, fuentes, bordes y formatos.
-   - _buildCellStyle() produce objeto de estilos correcto
-     para xlsx-js-style (font/fill/alignment/border/numFmt).
-   - _cssColorToArgb() maneja rgba() convirtiéndolo a
-     color sólido (ignora el canal alfa para XLSX).
-   - importStyles(): al cargar un archivo .xlsx lee los
-     estilos de celda (s) y los restaura en FMT/BORDERS.
-   - Menú contextual: opción "Eliminar columna" incluida.
-   - Todos los fixes de v7.8 se mantienen.
 =============================================== */
 'use strict';
 
@@ -23,7 +12,6 @@ HeriExcel.Pro — app.js  v7.9
 ================================================ */
 document.addEventListener('DOMContentLoaded', function() {
   initAutocomplete();
-  initFileHandlers();
   initContextMenu();
   initFindReplace();
   initFilterDropdown();
@@ -34,42 +22,70 @@ document.addEventListener('DOMContentLoaded', function() {
   initNoteDialog();
   renderCondRuleList();
 
-  if (typeof initDatePicker === 'function') initDatePicker();
-  if (typeof initEyeDropper === 'function') initEyeDropper();
+  if (typeof initDatePicker   === 'function') initDatePicker();
+  if (typeof initEyeDropper   === 'function') initEyeDropper();
+  if (typeof initTemplateSelector === 'function') initTemplateSelector();
+
+  /* initFileHandlers debe correr DESPUÉS de initTemplateSelector
+     porque éste reconstruye el DOM de #uploadSection */
+  initFileHandlers();
 });
 
 /* ================================================
    FILE HANDLERS
+   Usa getElementById en el momento del evento para
+   tolerar que initTemplateSelector() rehaga el DOM.
 ================================================ */
 function initFileHandlers() {
-  var fileInput = $('fileInput');
-  var dropZone  = $('dropZone');
-
-  fileInput.addEventListener('change', function(e) {
-    var file = e.target.files[0];
-    if (file) loadFile(file);
-    fileInput.value = '';
+  /* fileInput — delegado en document para sobrevivir reemplazos de DOM */
+  document.addEventListener('change', function(e) {
+    if (e.target && e.target.id === 'fileInput') {
+      var file = e.target.files[0];
+      if (file) loadFile(file);
+      e.target.value = '';
+    }
   });
 
-  dropZone.addEventListener('dragover', function(e) {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
+  /* dropZone — delegado en document */
+  document.addEventListener('dragover', function(e) {
+    var dz = document.getElementById('dropZone');
+    if (dz && dz.contains(e.target)) {
+      e.preventDefault();
+      dz.classList.add('drag-over');
+    }
   });
-  dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('drag-over'); });
-  dropZone.addEventListener('drop', function(e) {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    var file = e.dataTransfer.files[0];
-    if (file) loadFile(file);
+  document.addEventListener('dragleave', function(e) {
+    var dz = document.getElementById('dropZone');
+    if (dz && !dz.contains(e.relatedTarget)) {
+      dz.classList.remove('drag-over');
+    }
+  });
+  document.addEventListener('drop', function(e) {
+    var dz = document.getElementById('dropZone');
+    if (dz && dz.contains(e.target)) {
+      e.preventDefault();
+      dz.classList.remove('drag-over');
+      var file = e.dataTransfer.files[0];
+      if (file) loadFile(file);
+    }
   });
 
-  $('btnReset').addEventListener('click', resetApp);
-  $('btnRename').addEventListener('click', startRename);
-  $('fileNameInput').addEventListener('blur',    commitRename);
-  $('fileNameInput').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') commitRename();
-    if (e.key === 'Escape') cancelRename();
-  });
+  /* btnReset */
+  var btnReset = document.getElementById('btnReset');
+  if (btnReset) btnReset.addEventListener('click', resetApp);
+
+  /* btnRename / fileNameInput */
+  var btnRename = document.getElementById('btnRename');
+  if (btnRename) btnRename.addEventListener('click', startRename);
+
+  var fni = document.getElementById('fileNameInput');
+  if (fni) {
+    fni.addEventListener('blur', commitRename);
+    fni.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter')  commitRename();
+      if (e.key === 'Escape') cancelRename();
+    });
+  }
 }
 
 function loadFile(file) {
@@ -147,13 +163,9 @@ function loadSheet(sheetName) {
   STATE.colWidths     = {};
   STATE.rowHeights    = {};
 
-  /* Limpiar formatos previos de esta hoja */
   _clearSheetFmt(sheetName);
-
-  /* Importar estilos del archivo xlsx */
   importStyles(ws, sheetName);
 
-  /* Restaurar anchos de columna desde !cols */
   if (ws['!cols']) {
     ws['!cols'].forEach(function(col, ci) {
       if (col && col.wch) STATE.colWidths[ci] = Math.round(col.wch * 7);
@@ -181,14 +193,11 @@ function _clearSheetFmt(sheetName) {
 }
 
 /* ================================================
-   IMPORT STYLES — Lee estilos del xlsx y los
-   vuelca en FMT y BORDERS para que renderTable()
-   los aplique correctamente.
+   IMPORT STYLES
 ================================================ */
 function importStyles(ws, sheetName) {
   if (!ws || !sheetName) return;
 
-  /* Mapas de formato numérico inverso */
   var numFmtInverse = {
     '#,##0.00':     'number',
     '#,##0':        'integer',
@@ -203,7 +212,6 @@ function importStyles(ws, sheetName) {
     'yyyy-mm-dd':   'date',
   };
 
-  /* Iterar todas las celdas del worksheet */
   var ref = ws['!ref'];
   if (!ref) return;
   var range = XLSX.utils.decode_range(ref);
@@ -220,7 +228,6 @@ function importStyles(ws, sheetName) {
       var hasFmt    = false;
       var hasBorder = false;
 
-      /* ── Font ── */
       if (s.font) {
         if (s.font.bold)      { fmt.bold      = true; hasFmt = true; }
         if (s.font.italic)    { fmt.italic    = true; hasFmt = true; }
@@ -234,19 +241,16 @@ function importStyles(ws, sheetName) {
         }
       }
 
-      /* ── Fill (background) ── */
       if (s.fill) {
         var rgb = null;
         if (s.fill.fgColor && s.fill.fgColor.rgb) rgb = s.fill.fgColor.rgb;
         else if (s.fill.bgColor && s.fill.bgColor.rgb) rgb = s.fill.bgColor.rgb;
         if (rgb && rgb !== '00000000' && rgb !== 'FFFFFFFF' && rgb !== 'FF000000') {
-          /* Tomar los últimos 6 chars (ignorar canal alfa) */
           fmt.bgColor = '#' + rgb.slice(-6).toLowerCase();
           hasFmt = true;
         }
       }
 
-      /* ── Alignment ── */
       if (s.alignment && s.alignment.horizontal) {
         var ha = s.alignment.horizontal;
         if (ha === 'left' || ha === 'center' || ha === 'right') {
@@ -255,13 +259,11 @@ function importStyles(ws, sheetName) {
         }
       }
 
-      /* ── Number format ── */
       if (s.numFmt) {
         var nf = numFmtInverse[s.numFmt];
         if (nf) { fmt.numFormat = nf; hasFmt = true; }
       }
 
-      /* ── Borders ── */
       if (s.border) {
         var SIDES = ['top', 'bottom', 'left', 'right'];
         SIDES.forEach(function(side) {
@@ -292,8 +294,10 @@ function importStyles(ws, sheetName) {
    SHOW / HIDE EDITOR
 ================================================ */
 function showEditor() {
-  $('uploadSection').classList.add('hidden');
-  $('editorSection').classList.remove('hidden');
+  var uploadSection = document.getElementById('uploadSection');
+  var editorSection = document.getElementById('editorSection');
+  if (uploadSection) uploadSection.classList.add('hidden');
+  if (editorSection) editorSection.classList.remove('hidden');
   $('headerCenter').style.display = '';
   $('btnReset').classList.remove('hidden');
   $('btnExportMenu').classList.remove('hidden');
@@ -311,8 +315,12 @@ function resetApp() {
   STATE.selectedCells.clear();
   STATE.undoStack = []; STATE.redoStack = [];
   STATE.colWidths = {}; STATE.rowHeights = {};
-  $('uploadSection').classList.remove('hidden');
-  $('editorSection').classList.add('hidden');
+
+  var uploadSection = document.getElementById('uploadSection');
+  var editorSection = document.getElementById('editorSection');
+  if (uploadSection) uploadSection.classList.remove('hidden');
+  if (editorSection) editorSection.classList.add('hidden');
+
   $('headerCenter').style.display = 'none';
   $('btnReset').classList.add('hidden');
   $('btnExportMenu').classList.add('hidden');
@@ -1137,29 +1145,16 @@ function _injectQtyRow(menuId, afterId, inputId, maxVal, hint) {
 
 /* ================================================
    EXPORT — XLSX con estilos completos
-   Usa XLSXStyle (xlsx-js-style) cuando está
-   disponible para preservar todos los formatos.
-   Fallback a SheetJS estándar sin estilos.
 ================================================ */
-
-/**
- * Convierte color CSS a formato ARGB para xlsx-js-style.
- * Maneja #rgb, #rrggbb, rgb(), rgba() — el canal alfa
- * se ignora (XLSX no soporta transparencia real).
- */
 function _cssColorToArgb(css) {
   if (!css) return null;
   css = css.trim();
-
-  /* #rgb */
   if (/^#[0-9a-f]{3}$/i.test(css)) {
     css = '#' + css[1]+css[1] + css[2]+css[2] + css[3]+css[3];
   }
-  /* #rrggbb */
   if (/^#[0-9a-f]{6}$/i.test(css)) {
     return 'FF' + css.slice(1).toUpperCase();
   }
-  /* rgb(r,g,b) o rgba(r,g,b,a) — ignoramos alfa */
   var m = css.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
   if (m) {
     return 'FF' +
@@ -1170,25 +1165,16 @@ function _cssColorToArgb(css) {
   return null;
 }
 
-/**
- * Resuelve una variable CSS a su valor computado.
- * Necesario para colores definidos con var(--...).
- */
 function _resolveCssVar(val) {
   if (!val) return val;
   val = val.trim();
   if (!val.startsWith('var(')) return val;
-  /* Extraer nombre de variable */
   var m = val.match(/^var\(\s*(--[^,)]+)/);
   if (!m) return val;
   var resolved = getComputedStyle(document.documentElement).getPropertyValue(m[1]).trim();
   return resolved || val;
 }
 
-/**
- * Construye el objeto de estilo xlsx-js-style para una celda.
- * Retorna null si no hay ningún estilo aplicado.
- */
 function _buildCellStyle(r, c) {
   var fmtKey  = STATE.activeSheet + ':' + r + ',' + c;
   var fmt     = FMT[fmtKey]     || {};
@@ -1208,86 +1194,62 @@ function _buildCellStyle(r, c) {
 
   var style = {};
 
-  /* ── FONT ── */
   var fontObj = {};
   if (fmt.bold)      fontObj.bold      = true;
   if (fmt.italic)    fontObj.italic    = true;
   if (fmt.underline) fontObj.underline = true;
   if (fmt.strike)    fontObj.strike    = true;
-
   if (fmt.font) {
-    /* Extraer nombre limpio: "'JetBrains Mono', monospace" → "JetBrains Mono" */
     var fontName = fmt.font.replace(/'/g, '').split(',')[0].trim();
     if (fontName) fontObj.name = fontName;
   }
   if (fmt.size) {
     var pxVal = parseFloat(fmt.size);
-    if (!isNaN(pxVal)) fontObj.sz = Math.round(pxVal * 0.75); /* px → pt */
+    if (!isNaN(pxVal)) fontObj.sz = Math.round(pxVal * 0.75);
   }
   if (fmt.color) {
-    var colorResolved = _resolveCssVar(fmt.color);
-    var fc = _cssColorToArgb(colorResolved);
+    var fc = _cssColorToArgb(_resolveCssVar(fmt.color));
     if (fc) fontObj.color = { rgb: fc };
   }
   if (Object.keys(fontObj).length) style.font = fontObj;
 
-  /* ── FILL ── */
   var bgColor = fmt.bgColor;
-  /* Estilos predefinidos → color de fondo representativo */
   if (!bgColor && fmt.cellStyle) {
     var styleColorMap = {
-      header:  '#2d3050',
-      total:   '#2d3050',
-      good:    '#1a3a1a',
-      bad:     '#3a1a1a',
-      neutral: '#3a350a',
-      warning: '#3a2a0a',
+      header:'#2d3050', total:'#2d3050', good:'#1a3a1a',
+      bad:'#3a1a1a', neutral:'#3a350a', warning:'#3a2a0a',
     };
     bgColor = styleColorMap[fmt.cellStyle] || null;
   }
   if (bgColor) {
-    var bgResolved = _resolveCssVar(bgColor);
-    var bc = _cssColorToArgb(bgResolved);
-    if (bc) {
-      style.fill = { patternType: 'solid', fgColor: { rgb: bc } };
-    }
+    var bc = _cssColorToArgb(_resolveCssVar(bgColor));
+    if (bc) style.fill = { patternType: 'solid', fgColor: { rgb: bc } };
   }
 
-  /* ── ALIGNMENT ── */
   if (fmt.align && (fmt.align === 'left' || fmt.align === 'center' || fmt.align === 'right')) {
     style.alignment = { horizontal: fmt.align };
   }
 
-  /* ── NUMBER FORMAT ── */
   var numFmtMap = {
-    number:     '#,##0.00',
-    integer:    '#,##0',
-    currency:   '"$"#,##0.00',
-    percent:    '0.00"%"',
-    scientific: '0.00E+00',
-    date:       'dd/mm/yyyy',
+    number:'#,##0.00', integer:'#,##0', currency:'"$"#,##0.00',
+    percent:'0.00"%"', scientific:'0.00E+00', date:'dd/mm/yyyy',
   };
   if (fmt.numFormat && numFmtMap[fmt.numFormat]) {
     style.numFmt = numFmtMap[fmt.numFormat];
   }
 
-  /* ── BORDERS ── */
   if (hasBorder) {
     var borderObj = {};
-    var SIDES = ['top', 'bottom', 'left', 'right'];
-    SIDES.forEach(function(side) {
+    ['top','bottom','left','right'].forEach(function(side) {
       var bd = borders[side];
       if (!bd || !bd.color) return;
-
       var xlStyle = 'thin';
       if (bd.style === 'dashed') xlStyle = 'dashed';
       if (bd.style === 'double') xlStyle = 'double';
       var wNum = parseFloat(bd.width) || 1;
       if (wNum >= 3) xlStyle = 'thick';
       else if (wNum >= 2) xlStyle = 'medium';
-
-      var bColorResolved = _resolveCssVar(bd.color);
-      var bColor = _cssColorToArgb(bColorResolved);
+      var bColor = _cssColorToArgb(_resolveCssVar(bd.color));
       var entry  = { style: xlStyle };
       if (bColor) entry.color = { rgb: bColor };
       borderObj[side] = entry;
@@ -1298,15 +1260,9 @@ function _buildCellStyle(r, c) {
   return Object.keys(style).length ? style : null;
 }
 
-/**
- * Exporta el libro activo a .xlsx preservando todos los estilos.
- * Usa window.XLSXStyle (xlsx-js-style) si está disponible,
- * con fallback a XLSX estándar (sin estilos).
- */
 function exportXLSX() {
   if (!STATE.data.length) return showToast('No hay datos para exportar', '');
 
-  /* Determinar qué librería usar */
   var XL = window.XLSXStyle || XLSX;
   var hasStyles = !!(window.XLSXStyle);
 
@@ -1316,11 +1272,9 @@ function exportXLSX() {
       var wb = XL.utils.book_new();
       var ws = XL.utils.aoa_to_sheet(STATE.data);
 
-      /* ── Aplicar estilos celda a celda (solo si tenemos xlsx-js-style) ── */
       if (hasStyles) {
         var numRows = STATE.data.length;
         var numCols = STATE.data[0] ? STATE.data[0].length : 0;
-
         for (var r = 0; r < numRows; r++) {
           for (var c = 0; c < numCols; c++) {
             var cellStyle = _buildCellStyle(r, c);
@@ -1332,7 +1286,6 @@ function exportXLSX() {
         }
       }
 
-      /* ── Anchos de columna ── */
       var numCols2 = STATE.data[0] ? STATE.data[0].length : 0;
       var colInfo  = [];
       for (var ci = 0; ci < numCols2; ci++) {
@@ -1346,12 +1299,11 @@ function exportXLSX() {
       var fname = (STATE.fileName.replace(/\.[^.]+$/, '') || 'documento') + '.xlsx';
 
       if (hasStyles) {
-        /* xlsx-js-style requiere cellStyles:true y bookSST:true */
         XL.writeFile(wb, fname, { bookSST: true, cellStyles: true });
         showToast('Archivo guardado con estilos: ' + fname, 'success');
       } else {
         XL.writeFile(wb, fname);
-        showToast('Archivo guardado (sin estilos — xlsx-js-style no disponible): ' + fname, 'info');
+        showToast('Archivo guardado: ' + fname, 'info');
       }
 
       STATE.dirty = false;
