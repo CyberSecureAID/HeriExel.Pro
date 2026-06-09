@@ -1,17 +1,20 @@
-/* ===============================================
-   HeriExcel.Pro — app.js  v7.8
+HeriExcel.Pro — app.js  v7.9
    Carga de archivos, renderizado de tabla,
    contexto, filtros, busqueda, zoom,
    exportacion, impresion, fijar filas,
    notas, fill-handle
 
-   CAMBIOS v7.8:
-   - exportXLSX() ahora exporta COLORES, FUENTES,
-     BORDES, ALINEACIÓN y FORMATO NUMÉRICO usando
-     la API de estilos de SheetJS (cell_styles).
-   - Menú contextual: añadida opción
-     "Eliminar columna" junto a "Eliminar fila".
-   - Todos los fixes de v7.7 se mantienen intactos.
+   CAMBIOS v7.9:
+   - exportXLSX() usa XLSXStyle cuando está disponible
+     para preservar colores, fuentes, bordes y formatos.
+   - _buildCellStyle() produce objeto de estilos correcto
+     para xlsx-js-style (font/fill/alignment/border/numFmt).
+   - _cssColorToArgb() maneja rgba() convirtiéndolo a
+     color sólido (ignora el canal alfa para XLSX).
+   - importStyles(): al cargar un archivo .xlsx lee los
+     estilos de celda (s) y los restaura en FMT/BORDERS.
+   - Menú contextual: opción "Eliminar columna" incluida.
+   - Todos los fixes de v7.8 se mantienen.
 =============================================== */
 'use strict';
 
@@ -31,7 +34,6 @@ document.addEventListener('DOMContentLoaded', function() {
   initNoteDialog();
   renderCondRuleList();
 
-  /* Módulos opcionales (date picker + eyedropper) */
   if (typeof initDatePicker === 'function') initDatePicker();
   if (typeof initEyeDropper === 'function') initEyeDropper();
 });
@@ -78,7 +80,7 @@ function loadFile(file) {
   reader.onload = function(e) {
     try {
       var data = new Uint8Array(e.target.result);
-      var wb   = XLSX.read(data, { type: 'array', cellDates: true });
+      var wb   = XLSX.read(data, { type: 'array', cellDates: true, cellStyles: true });
       STATE.workbook   = wb;
       STATE.sheetNames = wb.SheetNames;
       loadSheet(wb.SheetNames[0]);
@@ -102,7 +104,6 @@ function loadSheet(sheetName) {
     header: 1, raw: false, defval: '', blankrows: true,
   });
 
-  /* Eliminar filas vacías al final */
   while (jsonData.length && jsonData[jsonData.length - 1].every(function(v) { return v === ''; })) {
     jsonData.pop();
   }
@@ -119,7 +120,6 @@ function loadSheet(sheetName) {
     return row;
   });
 
-  /* Mapa de celdas combinadas */
   STATE.mergeMap = {};
   if (ws['!merges']) {
     ws['!merges'].forEach(function(m) {
@@ -147,11 +147,145 @@ function loadSheet(sheetName) {
   STATE.colWidths     = {};
   STATE.rowHeights    = {};
 
+  /* Limpiar formatos previos de esta hoja */
+  _clearSheetFmt(sheetName);
+
+  /* Importar estilos del archivo xlsx */
+  importStyles(ws, sheetName);
+
+  /* Restaurar anchos de columna desde !cols */
+  if (ws['!cols']) {
+    ws['!cols'].forEach(function(col, ci) {
+      if (col && col.wch) STATE.colWidths[ci] = Math.round(col.wch * 7);
+    });
+  }
+
   renderSheetTabs();
   renderTable();
   updateStats();
   hideLoading();
   updateUnsaved();
+}
+
+/* ================================================
+   LIMPIA FORMATOS DE UNA HOJA
+================================================ */
+function _clearSheetFmt(sheetName) {
+  var prefix = sheetName + ':';
+  Object.keys(FMT).forEach(function(k) {
+    if (k.indexOf(prefix) === 0) delete FMT[k];
+  });
+  Object.keys(BORDERS).forEach(function(k) {
+    if (k.indexOf(prefix) === 0) delete BORDERS[k];
+  });
+}
+
+/* ================================================
+   IMPORT STYLES — Lee estilos del xlsx y los
+   vuelca en FMT y BORDERS para que renderTable()
+   los aplique correctamente.
+================================================ */
+function importStyles(ws, sheetName) {
+  if (!ws || !sheetName) return;
+
+  /* Mapas de formato numérico inverso */
+  var numFmtInverse = {
+    '#,##0.00':     'number',
+    '#,##0':        'integer',
+    '"$"#,##0.00':  'currency',
+    '0.00%':        'percent',
+    '0.00"%"':      'percent',
+    '0.00E+00':     'scientific',
+    'dd/mm/yyyy':   'date',
+    'dd/mm/yy':     'date',
+    'mm/dd/yy':     'date',
+    'm/d/yy':       'date',
+    'yyyy-mm-dd':   'date',
+  };
+
+  /* Iterar todas las celdas del worksheet */
+  var ref = ws['!ref'];
+  if (!ref) return;
+  var range = XLSX.utils.decode_range(ref);
+
+  for (var r = range.s.r; r <= range.e.r; r++) {
+    for (var c = range.s.c; c <= range.e.c; c++) {
+      var addr = XLSX.utils.encode_cell({ r: r, c: c });
+      var cell = ws[addr];
+      if (!cell || !cell.s) continue;
+
+      var s   = cell.s;
+      var fmt = {};
+      var borders = { top: null, bottom: null, left: null, right: null };
+      var hasFmt    = false;
+      var hasBorder = false;
+
+      /* ── Font ── */
+      if (s.font) {
+        if (s.font.bold)      { fmt.bold      = true; hasFmt = true; }
+        if (s.font.italic)    { fmt.italic    = true; hasFmt = true; }
+        if (s.font.underline) { fmt.underline = true; hasFmt = true; }
+        if (s.font.strike)    { fmt.strike    = true; hasFmt = true; }
+        if (s.font.name)      { fmt.font      = "'" + s.font.name + "', sans-serif"; hasFmt = true; }
+        if (s.font.sz)        { fmt.size      = Math.round(s.font.sz / 0.75) + 'px'; hasFmt = true; }
+        if (s.font.color && s.font.color.rgb) {
+          fmt.color = '#' + s.font.color.rgb.slice(-6).toLowerCase();
+          hasFmt = true;
+        }
+      }
+
+      /* ── Fill (background) ── */
+      if (s.fill) {
+        var rgb = null;
+        if (s.fill.fgColor && s.fill.fgColor.rgb) rgb = s.fill.fgColor.rgb;
+        else if (s.fill.bgColor && s.fill.bgColor.rgb) rgb = s.fill.bgColor.rgb;
+        if (rgb && rgb !== '00000000' && rgb !== 'FFFFFFFF' && rgb !== 'FF000000') {
+          /* Tomar los últimos 6 chars (ignorar canal alfa) */
+          fmt.bgColor = '#' + rgb.slice(-6).toLowerCase();
+          hasFmt = true;
+        }
+      }
+
+      /* ── Alignment ── */
+      if (s.alignment && s.alignment.horizontal) {
+        var ha = s.alignment.horizontal;
+        if (ha === 'left' || ha === 'center' || ha === 'right') {
+          fmt.align = ha;
+          hasFmt = true;
+        }
+      }
+
+      /* ── Number format ── */
+      if (s.numFmt) {
+        var nf = numFmtInverse[s.numFmt];
+        if (nf) { fmt.numFormat = nf; hasFmt = true; }
+      }
+
+      /* ── Borders ── */
+      if (s.border) {
+        var SIDES = ['top', 'bottom', 'left', 'right'];
+        SIDES.forEach(function(side) {
+          var bd = s.border[side];
+          if (bd && bd.style) {
+            var cssStyle = bd.style;
+            if (cssStyle === 'medium' || cssStyle === 'thick') cssStyle = 'solid';
+            if (cssStyle === 'thin') cssStyle = 'solid';
+            var width = '1px';
+            if (bd.style === 'medium') width = '2px';
+            if (bd.style === 'thick')  width = '3px';
+            var color = '#7c8cf8';
+            if (bd.color && bd.color.rgb) color = '#' + bd.color.rgb.slice(-6).toLowerCase();
+            borders[side] = { color: color, style: cssStyle, width: width };
+            hasBorder = true;
+          }
+        });
+      }
+
+      var key = sheetName + ':' + r + ',' + c;
+      if (hasFmt)    FMT[key]     = fmt;
+      if (hasBorder) BORDERS[key] = borders;
+    }
+  }
 }
 
 /* ================================================
@@ -193,7 +327,6 @@ function resetApp() {
 
 /* ================================================
    SHEET TABS
-   B-38 FIX: try/catch
 ================================================ */
 function renderSheetTabs() {
   var container = $('sheetTabs');
@@ -234,7 +367,6 @@ function renderTable() {
 
   var numCols = STATE.data[0] ? STATE.data[0].length : 0;
 
-  /* HEAD */
   var headRow  = document.createElement('tr');
   var thCorner = document.createElement('th');
   thCorner.textContent = '#';
@@ -289,7 +421,6 @@ function renderTable() {
   }
   thead.appendChild(headRow);
 
-  /* BODY */
   var startRow = STATE.frozen ? 1 : 0;
   var frag     = document.createDocumentFragment();
 
@@ -477,7 +608,6 @@ function applyZoom() {
   if (!table || !scroll) return;
 
   var scale = STATE.zoom / 100;
-
   table.style.transform = 'scale(1)';
   table.style.transformOrigin = 'top left';
 
@@ -485,10 +615,8 @@ function applyZoom() {
   var naturalH = table.scrollHeight;
 
   table.style.transform = 'scale(' + scale + ')';
-
   scroll.style.paddingRight  = Math.max(0, naturalW * scale - scroll.clientWidth  + 20) + 'px';
   scroll.style.paddingBottom = Math.max(0, naturalH * scale - scroll.clientHeight + 20) + 'px';
-
   $('zoomIndicator').textContent = STATE.zoom + '%';
 }
 
@@ -507,8 +635,7 @@ function sortByCol(asc) {
   var sheet     = STATE.activeSheet;
 
   var origOrder = body.map(function(_, i) { return startRow + i; });
-
-  var indexed = body.map(function(row, i) { return { row: row, origIdx: origOrder[i] }; });
+  var indexed   = body.map(function(row, i) { return { row: row, origIdx: origOrder[i] }; });
   indexed.sort(function(a, b) {
     var va = a.row[c] || '', vb = b.row[c] || '';
     var na = parseFloat(va), nb = parseFloat(vb);
@@ -516,8 +643,7 @@ function sortByCol(asc) {
     return asc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
   });
 
-  var newFmt     = {}, newBorders = {};
-
+  var newFmt = {}, newBorders = {};
   indexed.forEach(function(item, newBodyIdx) {
     var newR  = startRow + newBodyIdx;
     var origR = item.origIdx;
@@ -589,7 +715,6 @@ function shiftRowKeys(fromRow, delta, numCols) {
   } else {
     var deletedCount = -delta;
     var totalRows    = STATE.data.length;
-
     var savedFmt     = {}, savedBorders = {};
     for (var rs = fromRow + deletedCount; rs < totalRows; rs++) {
       for (var cs = 0; cs < numCols; cs++) {
@@ -598,7 +723,6 @@ function shiftRowKeys(fromRow, delta, numCols) {
         if (BORDERS[srcKey2]) savedBorders[rs + ',' + cs] = Object.assign({}, BORDERS[srcKey2]);
       }
     }
-
     for (var rd = fromRow; rd < totalRows; rd++) {
       for (var cd = 0; cd < numCols; cd++) {
         var dk = sheet + ':' + rd + ',' + cd;
@@ -606,7 +730,6 @@ function shiftRowKeys(fromRow, delta, numCols) {
         delete BORDERS[dk];
       }
     }
-
     for (var rw = fromRow + deletedCount; rw < totalRows; rw++) {
       var newR2 = rw - deletedCount;
       for (var cw = 0; cw < numCols; cw++) {
@@ -637,7 +760,6 @@ function shiftColKeys(fromCol, delta) {
   } else {
     var deletedCount2 = -delta;
     var totalCols     = STATE.data[0] ? STATE.data[0].length : 0;
-
     var savedFmt2     = {}, savedBorders2 = {};
     for (var rs2 = 0; rs2 < numRows; rs2++) {
       for (var cs2 = fromCol + deletedCount2; cs2 < totalCols; cs2++) {
@@ -646,7 +768,6 @@ function shiftColKeys(fromCol, delta) {
         if (BORDERS[srcKey3]) savedBorders2[rs2 + ',' + cs2] = Object.assign({}, BORDERS[srcKey3]);
       }
     }
-
     for (var rd2 = 0; rd2 < numRows; rd2++) {
       for (var cd2 = fromCol; cd2 < totalCols; cd2++) {
         var dk2 = sheet + ':' + rd2 + ',' + cd2;
@@ -654,7 +775,6 @@ function shiftColKeys(fromCol, delta) {
         delete BORDERS[dk2];
       }
     }
-
     for (var rw2 = 0; rw2 < numRows; rw2++) {
       for (var cw2 = fromCol + deletedCount2; cw2 < totalCols; cw2++) {
         var newC    = cw2 - deletedCount2;
@@ -687,9 +807,7 @@ function addRowAtEnd() {
   var qty  = getQtyFromInput('qtyAddRowEnd', 500);
   pushUndo();
   var cols = STATE.data[0] ? STATE.data[0].length : 1;
-  for (var i = 0; i < qty; i++) {
-    STATE.data.push(new Array(cols).fill(''));
-  }
+  for (var i = 0; i < qty; i++) STATE.data.push(new Array(cols).fill(''));
   renderTable(); updateStats(); markDirty();
   showToast(qty === 1 ? 'Fila agregada al final' : qty + ' filas agregadas al final', 'success');
 }
@@ -702,9 +820,7 @@ function addRowAbove() {
   pushUndo();
   var cols = STATE.data[0] ? STATE.data[0].length : 1;
   shiftRowKeys(r, +qty, cols);
-  for (var i = 0; i < qty; i++) {
-    STATE.data.splice(r, 0, new Array(cols).fill(''));
-  }
+  for (var i = 0; i < qty; i++) STATE.data.splice(r, 0, new Array(cols).fill(''));
   STATE.activeCellR = r + qty;
   renderTable(); updateStats(); markDirty();
   showToast(qty === 1 ? 'Fila insertada arriba' : qty + ' filas insertadas arriba', 'success');
@@ -718,9 +834,7 @@ function addRowBelow() {
   pushUndo();
   var cols = STATE.data[0] ? STATE.data[0].length : 1;
   shiftRowKeys(r + 1, +qty, cols);
-  for (var i = 0; i < qty; i++) {
-    STATE.data.splice(r + 1 + i, 0, new Array(cols).fill(''));
-  }
+  for (var i = 0; i < qty; i++) STATE.data.splice(r + 1 + i, 0, new Array(cols).fill(''));
   renderTable(); updateStats(); markDirty();
   showToast(qty === 1 ? 'Fila insertada abajo' : qty + ' filas insertadas abajo', 'success');
 }
@@ -780,9 +894,7 @@ function addColAtEnd() {
   closeAllDropdowns(null);
   var qty = getQtyFromInput('qtyAddColEnd', 100);
   pushUndo();
-  for (var i = 0; i < qty; i++) {
-    STATE.data.forEach(function(row) { row.push(''); });
-  }
+  for (var i = 0; i < qty; i++) STATE.data.forEach(function(row) { row.push(''); });
   renderTable(); updateStats(); markDirty();
   showToast(qty === 1 ? 'Columna agregada al final' : qty + ' columnas agregadas al final', 'success');
 }
@@ -794,9 +906,7 @@ function addColBefore() {
   var qty = getQtyFromInput('qtyAddColBefore', 100);
   pushUndo();
   shiftColKeys(c, +qty);
-  for (var i = 0; i < qty; i++) {
-    STATE.data.forEach(function(row) { row.splice(c + i, 0, ''); });
-  }
+  for (var i = 0; i < qty; i++) STATE.data.forEach(function(row) { row.splice(c + i, 0, ''); });
   var newWidths = {};
   Object.keys(STATE.colWidths).forEach(function(k) {
     var ki = parseInt(k);
@@ -858,40 +968,11 @@ function injectQtyStyles() {
   var style = document.createElement('style');
   style.id = 'hx-qty-styles';
   style.textContent = [
-    '.hx-qty-row {',
-    '  display: flex;',
-    '  align-items: center;',
-    '  gap: 6px;',
-    '  padding: 2px 10px 6px;',
-    '  border-top: 1px solid var(--border);',
-    '  margin-top: 2px;',
-    '}',
-    '.hx-qty-label {',
-    '  font-size: 10.5px;',
-    '  color: var(--text-muted);',
-    '  white-space: nowrap;',
-    '  flex-shrink: 0;',
-    '}',
-    '.hx-qty-input {',
-    '  width: 60px;',
-    '  height: 24px;',
-    '  background: var(--bg-panel);',
-    '  border: 1px solid var(--border);',
-    '  border-radius: var(--radius);',
-    '  color: var(--text-primary);',
-    '  font-family: var(--font-mono);',
-    '  font-size: 12px;',
-    '  padding: 0 6px;',
-    '  outline: none;',
-    '  text-align: center;',
-    '  user-select: text;',
-    '}',
-    '.hx-qty-input:focus { border-color: var(--accent); }',
-    '.hx-qty-hint {',
-    '  font-size: 10px;',
-    '  color: var(--text-muted);',
-    '  opacity: 0.7;',
-    '}',
+    '.hx-qty-row{display:flex;align-items:center;gap:6px;padding:2px 10px 6px;border-top:1px solid var(--border);margin-top:2px;}',
+    '.hx-qty-label{font-size:10.5px;color:var(--text-muted);white-space:nowrap;flex-shrink:0;}',
+    '.hx-qty-input{width:60px;height:24px;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:0 6px;outline:none;text-align:center;user-select:text;}',
+    '.hx-qty-input:focus{border-color:var(--accent);}',
+    '.hx-qty-hint{font-size:10px;color:var(--text-muted);opacity:0.7;}',
   ].join('\n');
   document.head.appendChild(style);
 }
@@ -905,11 +986,9 @@ function initRibbonActions() {
   _injectQtyRow('ddRowsMenu', 'btnAddRow',     'qtyAddRowEnd',   500, 'Cantidad de filas a agregar al final');
   _injectQtyRow('ddRowsMenu', 'btnAddRowAbove','qtyAddRowAbove', 500, 'Cantidad de filas a insertar arriba');
   _injectQtyRow('ddRowsMenu', 'btnAddRowBelow','qtyAddRowBelow', 500, 'Cantidad de filas a insertar abajo');
-
   _injectQtyRow('ddColsMenu', 'btnAddCol',      'qtyAddColEnd',    100, 'Cantidad de columnas a agregar al final');
   _injectQtyRow('ddColsMenu', 'btnAddColBefore','qtyAddColBefore', 100, 'Cantidad de columnas a insertar antes');
 
-  /* Filas */
   var btnAddRow              = $('btnAddRow');
   var btnAddRowAbove         = $('btnAddRowAbove');
   var btnAddRowBelow         = $('btnAddRowBelow');
@@ -923,7 +1002,6 @@ function initRibbonActions() {
   if (btnDeleteRow)           btnDeleteRow.addEventListener('click',           deleteActiveRow);
   if (btnDeleteSelectionRows) btnDeleteSelectionRows.addEventListener('click', deleteSelectionRows);
 
-  /* Columnas */
   var btnAddCol       = $('btnAddCol');
   var btnAddColBefore = $('btnAddColBefore');
   var btnSplitCol     = $('btnSplitCol');
@@ -933,19 +1011,16 @@ function initRibbonActions() {
   if (btnSplitCol)     btnSplitCol.addEventListener('click',    splitColumnInHalf);
   if (btnDeleteCol)    btnDeleteCol.addEventListener('click',   deleteActiveCol);
 
-  /* Exportar */
   var btnExportXLSX = $('btnExportXLSX');
   var btnExportCSV  = $('btnExportCSV');
   if (btnExportXLSX) btnExportXLSX.addEventListener('click', function() { closeAllDropdowns(null); exportXLSX(); });
   if (btnExportCSV)  btnExportCSV.addEventListener('click',  function() { closeAllDropdowns(null); exportCSV();  });
 
-  /* Ordenar */
   var btnSortAsc  = $('btnSortAsc');
   var btnSortDesc = $('btnSortDesc');
   if (btnSortAsc)  btnSortAsc.addEventListener('click',  function() { sortByCol(true);  });
   if (btnSortDesc) btnSortDesc.addEventListener('click', function() { sortByCol(false); });
 
-  /* Congelar */
   var btnFreeze = $('btnFreeze');
   if (btnFreeze) {
     btnFreeze.addEventListener('click', function() {
@@ -957,11 +1032,9 @@ function initRibbonActions() {
     });
   }
 
-  /* Limpiar celda */
   var btnClearCell = $('btnClearCell');
   if (btnClearCell) btnClearCell.addEventListener('click', clearActiveCells);
 
-  /* Buscar inline */
   var searchInput = $('searchInput');
   if (searchInput) {
     searchInput.addEventListener('input', function() {
@@ -972,10 +1045,8 @@ function initRibbonActions() {
     });
   }
 
-  /* Reemplazar inline */
   var btnReplace    = $('btnReplace');
   var btnReplaceAll = $('btnReplaceAll');
-
   if (btnReplace) {
     btnReplace.addEventListener('click', function() {
       var q   = $('searchInput').value.trim();
@@ -1000,7 +1071,6 @@ function initRibbonActions() {
       showToast('Reemplazado', 'success');
     });
   }
-
   if (btnReplaceAll) {
     btnReplaceAll.addEventListener('click', function() {
       var q   = $('searchInput').value.trim();
@@ -1026,7 +1096,6 @@ function initRibbonActions() {
     });
   }
 
-  /* Zoom */
   var btnZoomIn  = $('btnZoomIn');
   var btnZoomOut = $('btnZoomOut');
   if (btnZoomIn) {
@@ -1052,7 +1121,6 @@ function _injectQtyRow(menuId, afterId, inputId, maxVal, hint) {
   var menu = document.getElementById(menuId);
   var btn  = document.getElementById(afterId);
   if (!menu || !btn) return;
-
   var row = document.createElement('div');
   row.className = 'hx-qty-row';
   row.innerHTML =
@@ -1061,28 +1129,29 @@ function _injectQtyRow(menuId, afterId, inputId, maxVal, hint) {
     '  min="1" max="' + maxVal + '" value="1" ' +
     '  title="' + hint + '" autocomplete="off" />' +
     '<span class="hx-qty-hint">máx ' + maxVal + '</span>';
-
   row.addEventListener('click',      function(e) { e.stopPropagation(); });
   row.addEventListener('mousedown',  function(e) { e.stopPropagation(); });
   row.addEventListener('keydown',    function(e) { e.stopPropagation(); });
-
   btn.insertAdjacentElement('afterend', row);
 }
 
 /* ================================================
-   EXPORT — v7.8: con estilos completos
-   Convierte FMT y BORDERS a estilos XLSX nativos
-   (font, fill, alignment, border, numFmt).
+   EXPORT — XLSX con estilos completos
+   Usa XLSXStyle (xlsx-js-style) cuando está
+   disponible para preservar todos los formatos.
+   Fallback a SheetJS estándar sin estilos.
 ================================================ */
 
 /**
- * Convierte un color CSS (#rrggbb / rgb(...) / nombre)
- * al formato ARGB que usa SheetJS: "FF" + rrggbb en mayúsculas.
+ * Convierte color CSS a formato ARGB para xlsx-js-style.
+ * Maneja #rgb, #rrggbb, rgb(), rgba() — el canal alfa
+ * se ignora (XLSX no soporta transparencia real).
  */
 function _cssColorToArgb(css) {
   if (!css) return null;
   css = css.trim();
-  /* #rgb → #rrggbb */
+
+  /* #rgb */
   if (/^#[0-9a-f]{3}$/i.test(css)) {
     css = '#' + css[1]+css[1] + css[2]+css[2] + css[3]+css[3];
   }
@@ -1090,7 +1159,7 @@ function _cssColorToArgb(css) {
   if (/^#[0-9a-f]{6}$/i.test(css)) {
     return 'FF' + css.slice(1).toUpperCase();
   }
-  /* rgb(r,g,b) */
+  /* rgb(r,g,b) o rgba(r,g,b,a) — ignoramos alfa */
   var m = css.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
   if (m) {
     return 'FF' +
@@ -1102,7 +1171,22 @@ function _cssColorToArgb(css) {
 }
 
 /**
- * Construye el objeto de estilo SheetJS para una celda dada (r, c).
+ * Resuelve una variable CSS a su valor computado.
+ * Necesario para colores definidos con var(--...).
+ */
+function _resolveCssVar(val) {
+  if (!val) return val;
+  val = val.trim();
+  if (!val.startsWith('var(')) return val;
+  /* Extraer nombre de variable */
+  var m = val.match(/^var\(\s*(--[^,)]+)/);
+  if (!m) return val;
+  var resolved = getComputedStyle(document.documentElement).getPropertyValue(m[1]).trim();
+  return resolved || val;
+}
+
+/**
+ * Construye el objeto de estilo xlsx-js-style para una celda.
  * Retorna null si no hay ningún estilo aplicado.
  */
 function _buildCellStyle(r, c) {
@@ -1110,17 +1194,17 @@ function _buildCellStyle(r, c) {
   var fmt     = FMT[fmtKey]     || {};
   var borders = BORDERS[fmtKey] || {};
 
-  var hasStyle =
-    fmt.bold || fmt.italic || fmt.underline || fmt.strike ||
-    fmt.font || fmt.size || fmt.color || fmt.bgColor ||
-    fmt.align || fmt.numFormat ||
-    fmt.cellStyle ||
-    (borders.top && borders.top.color) ||
-    (borders.bottom && borders.bottom.color) ||
-    (borders.left && borders.left.color) ||
-    (borders.right && borders.right.color);
+  var hasFmt = fmt.bold || fmt.italic || fmt.underline || fmt.strike ||
+               fmt.font || fmt.size || fmt.color || fmt.bgColor ||
+               fmt.align || (fmt.numFormat && fmt.numFormat !== 'general') ||
+               fmt.cellStyle;
 
-  if (!hasStyle) return null;
+  var hasBorder = (borders.top && borders.top.color) ||
+                  (borders.bottom && borders.bottom.color) ||
+                  (borders.left && borders.left.color) ||
+                  (borders.right && borders.right.color);
+
+  if (!hasFmt && !hasBorder) return null;
 
   var style = {};
 
@@ -1130,45 +1214,49 @@ function _buildCellStyle(r, c) {
   if (fmt.italic)    fontObj.italic    = true;
   if (fmt.underline) fontObj.underline = true;
   if (fmt.strike)    fontObj.strike    = true;
-  if (fmt.font)      fontObj.name      = fmt.font.replace(/'/g,'').split(',')[0].trim();
+
+  if (fmt.font) {
+    /* Extraer nombre limpio: "'JetBrains Mono', monospace" → "JetBrains Mono" */
+    var fontName = fmt.font.replace(/'/g, '').split(',')[0].trim();
+    if (fontName) fontObj.name = fontName;
+  }
   if (fmt.size) {
-    var pts = parseFloat(fmt.size);
-    if (!isNaN(pts)) fontObj.sz = pts * 0.75; /* px → pt aprox */
+    var pxVal = parseFloat(fmt.size);
+    if (!isNaN(pxVal)) fontObj.sz = Math.round(pxVal * 0.75); /* px → pt */
   }
   if (fmt.color) {
-    var fc = _cssColorToArgb(fmt.color);
+    var colorResolved = _resolveCssVar(fmt.color);
+    var fc = _cssColorToArgb(colorResolved);
     if (fc) fontObj.color = { rgb: fc };
   }
   if (Object.keys(fontObj).length) style.font = fontObj;
 
-  /* ── FILL (background color) ── */
+  /* ── FILL ── */
   var bgColor = fmt.bgColor;
-  /* Estilos predefinidos: derivar color de fondo */
+  /* Estilos predefinidos → color de fondo representativo */
   if (!bgColor && fmt.cellStyle) {
-    var styleMap = {
-      header:  '#1e1f2e',
+    var styleColorMap = {
+      header:  '#2d3050',
       total:   '#2d3050',
-      good:    'rgba(74,222,128,0.18)',
-      bad:     'rgba(248,113,113,0.18)',
-      neutral: 'rgba(251,191,36,0.18)',
-      warning: 'rgba(251,146,60,0.18)',
+      good:    '#1a3a1a',
+      bad:     '#3a1a1a',
+      neutral: '#3a350a',
+      warning: '#3a2a0a',
     };
-    bgColor = styleMap[fmt.cellStyle] || null;
+    bgColor = styleColorMap[fmt.cellStyle] || null;
   }
   if (bgColor) {
-    var bc = _cssColorToArgb(bgColor);
+    var bgResolved = _resolveCssVar(bgColor);
+    var bc = _cssColorToArgb(bgResolved);
     if (bc) {
       style.fill = { patternType: 'solid', fgColor: { rgb: bc } };
     }
   }
 
   /* ── ALIGNMENT ── */
-  var alignObj = {};
-  if (fmt.align) {
-    var xlAlign = { left: 'left', center: 'center', right: 'right' };
-    if (xlAlign[fmt.align]) alignObj.horizontal = xlAlign[fmt.align];
+  if (fmt.align && (fmt.align === 'left' || fmt.align === 'center' || fmt.align === 'right')) {
+    style.alignment = { horizontal: fmt.align };
   }
-  if (Object.keys(alignObj).length) style.alignment = alignObj;
 
   /* ── NUMBER FORMAT ── */
   var numFmtMap = {
@@ -1184,75 +1272,90 @@ function _buildCellStyle(r, c) {
   }
 
   /* ── BORDERS ── */
-  var borderObj = {};
-  var SIDES = ['top', 'bottom', 'left', 'right'];
-  SIDES.forEach(function(side) {
-    var bd = borders[side];
-    if (!bd) return;
-    var bStyle = bd.style || 'thin';
-    /* Mapear estilos CSS a SheetJS */
-    var xlStyle = 'thin';
-    if (bStyle === 'dashed')  xlStyle = 'dashed';
-    if (bStyle === 'double')  xlStyle = 'double';
-    if (bd.width && parseFloat(bd.width) >= 2) xlStyle = 'medium';
-    if (bd.width && parseFloat(bd.width) >= 3) xlStyle = 'thick';
-    var bColor = _cssColorToArgb(bd.color);
-    var entry  = { style: xlStyle };
-    if (bColor) entry.color = { rgb: bColor };
-    borderObj[side] = entry;
-  });
-  if (Object.keys(borderObj).length) style.border = borderObj;
+  if (hasBorder) {
+    var borderObj = {};
+    var SIDES = ['top', 'bottom', 'left', 'right'];
+    SIDES.forEach(function(side) {
+      var bd = borders[side];
+      if (!bd || !bd.color) return;
+
+      var xlStyle = 'thin';
+      if (bd.style === 'dashed') xlStyle = 'dashed';
+      if (bd.style === 'double') xlStyle = 'double';
+      var wNum = parseFloat(bd.width) || 1;
+      if (wNum >= 3) xlStyle = 'thick';
+      else if (wNum >= 2) xlStyle = 'medium';
+
+      var bColorResolved = _resolveCssVar(bd.color);
+      var bColor = _cssColorToArgb(bColorResolved);
+      var entry  = { style: xlStyle };
+      if (bColor) entry.color = { rgb: bColor };
+      borderObj[side] = entry;
+    });
+    if (Object.keys(borderObj).length) style.border = borderObj;
+  }
 
   return Object.keys(style).length ? style : null;
 }
 
 /**
- * Exporta el libro con todos los estilos (colores, fuentes, bordes).
- * Usa la API de estilos de SheetJS (requiere la versión full incluida).
+ * Exporta el libro activo a .xlsx preservando todos los estilos.
+ * Usa window.XLSXStyle (xlsx-js-style) si está disponible,
+ * con fallback a XLSX estándar (sin estilos).
  */
 function exportXLSX() {
   if (!STATE.data.length) return showToast('No hay datos para exportar', '');
+
+  /* Determinar qué librería usar */
+  var XL = window.XLSXStyle || XLSX;
+  var hasStyles = !!(window.XLSXStyle);
+
   showLoading('Exportando...');
   setTimeout(function() {
     try {
-      var wb = XLSX.utils.book_new();
-      var ws = XLSX.utils.aoa_to_sheet(STATE.data);
+      var wb = XL.utils.book_new();
+      var ws = XL.utils.aoa_to_sheet(STATE.data);
 
-      /* ── Aplicar estilos celda a celda ── */
-      var numRows = STATE.data.length;
-      var numCols = STATE.data[0] ? STATE.data[0].length : 0;
+      /* ── Aplicar estilos celda a celda (solo si tenemos xlsx-js-style) ── */
+      if (hasStyles) {
+        var numRows = STATE.data.length;
+        var numCols = STATE.data[0] ? STATE.data[0].length : 0;
 
-      for (var r = 0; r < numRows; r++) {
-        for (var c = 0; c < numCols; c++) {
-          var cellAddr = XLSX.utils.encode_cell({ r: r, c: c });
-          var cellStyle = _buildCellStyle(r, c);
-          if (cellStyle) {
-            if (!ws[cellAddr]) {
-              ws[cellAddr] = { t: 's', v: '' };
-            }
+        for (var r = 0; r < numRows; r++) {
+          for (var c = 0; c < numCols; c++) {
+            var cellStyle = _buildCellStyle(r, c);
+            if (!cellStyle) continue;
+            var cellAddr = XL.utils.encode_cell({ r: r, c: c });
+            if (!ws[cellAddr]) ws[cellAddr] = { t: 's', v: '' };
             ws[cellAddr].s = cellStyle;
           }
         }
       }
 
       /* ── Anchos de columna ── */
-      var colInfo = [];
-      for (var ci = 0; ci < numCols; ci++) {
+      var numCols2 = STATE.data[0] ? STATE.data[0].length : 0;
+      var colInfo  = [];
+      for (var ci = 0; ci < numCols2; ci++) {
         var w = STATE.colWidths[ci];
         colInfo.push(w ? { wch: Math.round(w / 7) } : { wch: 14 });
       }
       ws['!cols'] = colInfo;
 
-      XLSX.utils.book_append_sheet(wb, ws, STATE.activeSheet || 'Hoja1');
+      XL.utils.book_append_sheet(wb, ws, STATE.activeSheet || 'Hoja1');
 
       var fname = (STATE.fileName.replace(/\.[^.]+$/, '') || 'documento') + '.xlsx';
 
-      /* writeFile con bookSST:true y cellStyles:true para preservar estilos */
-      XLSX.writeFile(wb, fname, { bookSST: true, cellStyles: true });
+      if (hasStyles) {
+        /* xlsx-js-style requiere cellStyles:true y bookSST:true */
+        XL.writeFile(wb, fname, { bookSST: true, cellStyles: true });
+        showToast('Archivo guardado con estilos: ' + fname, 'success');
+      } else {
+        XL.writeFile(wb, fname);
+        showToast('Archivo guardado (sin estilos — xlsx-js-style no disponible): ' + fname, 'info');
+      }
 
       STATE.dirty = false;
       updateUnsaved();
-      showToast('Archivo guardado con estilos: ' + fname, 'success');
     } catch (err) {
       showToast('Error al exportar: ' + err.message, 'error');
       console.error('exportXLSX error:', err);
@@ -1267,8 +1370,7 @@ function exportCSV() {
     return row.map(function(v) {
       var s = String(v);
       return (s.indexOf(',') !== -1 || s.indexOf('"') !== -1 || s.indexOf('\n') !== -1)
-        ? '"' + s.replace(/"/g, '""') + '"'
-        : s;
+        ? '"' + s.replace(/"/g, '""') + '"' : s;
     }).join(',');
   }).join('\n');
   var blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
@@ -1367,10 +1469,7 @@ function frpGoTo(idx) {
   var match = _frpMatches[_frpIdx];
   activateCell(match.r, match.c);
   var span2 = getCellSpan(match.r, match.c);
-  if (span2) {
-    clearSearchHighlights();
-    span2.classList.add('search-current');
-  }
+  if (span2) { clearSearchHighlights(); span2.classList.add('search-current'); }
   $('frpInfo').textContent = (_frpIdx + 1) + ' / ' + _frpMatches.length;
 }
 
@@ -1412,7 +1511,6 @@ function initFindReplace() {
       showToast('Reemplazado', 'success');
     });
   }
-
   if (frpReplaceAll) {
     frpReplaceAll.addEventListener('click', function() {
       var q3       = $('frpFind').value;
@@ -1425,16 +1523,13 @@ function initFindReplace() {
       var flags3 = caseSen3 ? 'g' : 'gi';
       var esc3   = q3.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       var regex3 = new RegExp(esc3, flags3);
-
       STATE.data.forEach(function(row, r) {
         row.forEach(function(val, c) {
           var v = String(val), s = q3;
           if (!caseSen3) { v = v.toLowerCase(); s = s.toLowerCase(); }
           var matches3 = whole3 ? v === s : v.indexOf(s) !== -1;
           if (matches3) {
-            STATE.data[r][c] = whole3
-              ? rep3
-              : String(STATE.data[r][c]).replace(regex3, rep3);
+            STATE.data[r][c] = whole3 ? rep3 : String(STATE.data[r][c]).replace(regex3, rep3);
             count2++;
           }
         });
@@ -1447,7 +1542,6 @@ function initFindReplace() {
 
 /* ================================================
    CONTEXT MENU
-   v7.8: añadida opción "Eliminar columna"
 ================================================ */
 function initContextMenu() {
   document.addEventListener('click', function(e) {
@@ -1457,7 +1551,6 @@ function initContextMenu() {
 
 function showContextMenu(e, r, c) {
   activateCell(r, c);
-
   var ctx = $('contextMenu');
   ctx.innerHTML = '';
 
@@ -1584,7 +1677,6 @@ function showContextMenu(e, r, c) {
   });
 
   ctx.classList.remove('hidden');
-
   requestAnimationFrame(function() {
     var cw = ctx.offsetWidth  || 200;
     var ch = ctx.offsetHeight || 300;
@@ -1666,10 +1758,7 @@ function openFilterDropdown(c, iconEl) {
 function applyColumnFilter() {
   var checkboxes = $('filterOptions').querySelectorAll('input[type="checkbox"]:checked');
   var vals = Array.from(checkboxes).map(function(cb) { return cb.value; });
-  if (!vals.length) {
-    showToast('Selecciona al menos un valor para filtrar', '');
-    return;
-  }
+  if (!vals.length) { showToast('Selecciona al menos un valor para filtrar', ''); return; }
   STATE.activeFilters[_filterCol] = vals;
   hideFilterDropdown();
   renderTable();
@@ -1683,19 +1772,14 @@ function hideFilterDropdown() { $('filterDropdown').classList.add('hidden'); }
 ================================================ */
 function initColResize(th, colIdx, handle) {
   handle.addEventListener('mousedown', function(e) {
-    e.preventDefault();
-    e.stopPropagation();
+    e.preventDefault(); e.stopPropagation();
     var startX = e.clientX;
-    var startW = STATE.colWidths[colIdx] !== undefined
-      ? STATE.colWidths[colIdx]
-      : (th.offsetWidth || 90);
-
+    var startW = STATE.colWidths[colIdx] !== undefined ? STATE.colWidths[colIdx] : (th.offsetWidth || 90);
     document.body.style.cursor     = 'col-resize';
     document.body.style.userSelect = 'none';
 
     var onMove = function(ev) {
-      var delta = ev.clientX - startX;
-      var w = Math.max(20, startW + delta);
+      var w = Math.max(20, startW + ev.clientX - startX);
       STATE.colWidths[colIdx] = w;
       th.style.minWidth = w + 'px';
       th.style.width    = w + 'px';
@@ -1780,7 +1864,6 @@ function executeFillDown() {
   seedVals = seedVals.filter(function(v) { return v !== ''; });
 
   var seq = detectSequence(seedVals);
-
   for (var r = minR + 1; r <= maxR; r++) {
     if (seq) {
       STATE.data[r][c0] = getNextSequenceValue(seq, r - r0);
@@ -1888,10 +1971,7 @@ function initNoteDialog() {
       dlg.style.display = 'none';
       if (_noteCallback) { _noteCallback(val2); _noteCallback = null; }
     }
-    if (e.key === 'Escape') {
-      dlg.style.display = 'none';
-      _noteCallback = null;
-    }
+    if (e.key === 'Escape') { dlg.style.display = 'none'; _noteCallback = null; }
   });
 }
 
@@ -1903,11 +1983,8 @@ function addNote(r, c) {
   document.getElementById('noteTextarea').focus();
   _noteCallback = function(note) {
     if (!STATE.cellNotes) STATE.cellNotes = {};
-    if (note.trim()) {
-      STATE.cellNotes[r + ',' + c] = note;
-    } else {
-      delete STATE.cellNotes[r + ',' + c];
-    }
+    if (note.trim()) STATE.cellNotes[r + ',' + c] = note;
+    else delete STATE.cellNotes[r + ',' + c];
     renderNoteIndicator(r, c);
     markDirty();
     showToast(note.trim() ? 'Nota guardada' : 'Nota eliminada', 'success');
@@ -1931,9 +2008,7 @@ function renderNoteIndicator(r, c, td) {
 /* ================================================
    PRINT
 ================================================ */
-function printPreview() {
-  window.print();
-}
+function printPreview() { window.print(); }
 
 /* ================================================
    RENAME FILE
