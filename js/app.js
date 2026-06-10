@@ -1,9 +1,15 @@
 /* ===============================================
-   HeriExcel.Pro — app.js  v7.9
+   HeriExcel.Pro — app.js  v7.10
    Carga de archivos, renderizado de tabla,
    contexto, filtros, busqueda, zoom,
    exportacion, impresion, fijar filas,
    notas, fill-handle
+
+   FIX v7.10:
+   - loadFile usa XLSXStyle (xlsx-js-style) para
+     leer archivos cuando está disponible, de modo
+     que cell.s se rellena correctamente y
+     importStyles puede leer bordes, colores, etc.
 =============================================== */
 'use strict';
 
@@ -88,6 +94,11 @@ function initFileHandlers() {
   }
 }
 
+/* ================================================
+   LOAD FILE
+   FIX v7.10: usa XLSXStyle para leer cuando está
+   disponible, garantizando que cell.s se rellene.
+================================================ */
 function loadFile(file) {
   STATE.fileName = file.name;
   showLoading('Leyendo archivo...');
@@ -96,7 +107,13 @@ function loadFile(file) {
   reader.onload = function(e) {
     try {
       var data = new Uint8Array(e.target.result);
-      var wb   = XLSX.read(data, { type: 'array', cellDates: true, cellStyles: true });
+
+      /* Usar XLSXStyle (xlsx-js-style) para leer si está disponible,
+         ya que esta librería sí rellena cell.s al leer archivos. */
+      var XL = (window.XLSXStyle) ? window.XLSXStyle : XLSX;
+
+      var wb = XL.read(data, { type: 'array', cellDates: true, cellStyles: true });
+
       STATE.workbook   = wb;
       STATE.sheetNames = wb.SheetNames;
       loadSheet(wb.SheetNames[0]);
@@ -116,7 +133,11 @@ function loadSheet(sheetName) {
   var ws  = STATE.workbook.Sheets[sheetName];
   STATE.wsRaw = ws;
 
-  var jsonData = XLSX.utils.sheet_to_json(ws, {
+  /* Para convertir a JSON usamos el XLSX original (SheetJS) para máxima
+     compatibilidad de lectura de datos. */
+  var XLread = window._SheetJS || XLSX;
+
+  var jsonData = XLread.utils.sheet_to_json(ws, {
     header: 1, raw: false, defval: '', blankrows: true,
   });
 
@@ -194,6 +215,7 @@ function _clearSheetFmt(sheetName) {
 
 /* ================================================
    IMPORT STYLES
+   Funciona con cell.s rellenado por XLSXStyle.
 ================================================ */
 function importStyles(ws, sheetName) {
   if (!ws || !sheetName) return;
@@ -212,13 +234,16 @@ function importStyles(ws, sheetName) {
     'yyyy-mm-dd':   'date',
   };
 
+  /* Usar encode_cell/decode_range del parser disponible */
+  var XLu = (window.XLSXStyle) ? window.XLSXStyle : XLSX;
+
   var ref = ws['!ref'];
   if (!ref) return;
-  var range = XLSX.utils.decode_range(ref);
+  var range = XLu.utils.decode_range(ref);
 
   for (var r = range.s.r; r <= range.e.r; r++) {
     for (var c = range.s.c; c <= range.e.c; c++) {
-      var addr = XLSX.utils.encode_cell({ r: r, c: c });
+      var addr = XLu.utils.encode_cell({ r: r, c: c });
       var cell = ws[addr];
       if (!cell || !cell.s) continue;
 
